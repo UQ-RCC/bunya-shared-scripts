@@ -1,0 +1,330 @@
+#!/usr/bin/env python3
+"""
+slurm-api-login
+=================
+Authenticates a user with Keycloak via the Device Authorization Grant flow
+(RFC 8628) and stores the resulting tokens for use by scripts and tools.
+
+Usage:
+    slurm-api-login              # Authenticate (or re-authenticate)
+    slurm-api-login --token      # Print the current access token (refreshing if needed)
+    slurm-api-login --status     # Show token status without refreshing
+    slurm-api-login --logout     # Remove stored tokens
+
+Token storage:
+    ~/.config/slurm-api/token.json  (mode 0600, owner-readable only)
+
+This file is read by slurm-api-curl and any script that needs to call
+the Slurm proxy API. The access token is refreshed automatically when it
+is within 60 seconds of expiry.
+Configuration:
+    Edit the CONFIGURATION section below, or set environment variables:
+        SLURM_KEYCLOAK_URL       Keycloak realm URL
+        SLURM_KEYCLOAK_CLIENT_ID OAuth2 client ID (public client, no secret needed)
+"""
+
+import argparse
+import json
+import os
+import stat
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+# ============================================================
+# CONFIGURATION — site admins edit these defaults
+# ============================================================
+DEFAULT_KEYCLOAK_URL = os.environ.get(
+    "SLURM_KEYCLOAK_URL",
+    "https://iam.rcc.uq.edu.au/auth/realms/bunya",
+)
+DEFAULT_CLIENT_ID = os.environ.get("SLURM_KEYCLOAK_CLIENT_ID", "slurm-proxy")
+# ============================================================
+
+TOKEN_DIR = Path.home() / ".config" / "slurm-api"
+TOKEN_FILE = TOKEN_DIR / "token.json"
+
+# Refresh the access token if it expires within this many seconds
+REFRESH_BUFFER_SECONDS = 60
+
+
+# ------------------------------------------------------------------ #
+# HTTP helper                                                          #
+# ------------------------------------------------------------------ #
+
+def _post(url: str, data: dict) -> dict:
+    """POST form-encoded data, return parsed JSON. Raises on HTTP error."""
+    encoded = urllib.parse.urlencode(data).encode()
+    req = urllib.request.Request(
+        url,
+        data=encoded,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode()
+        try:
+            return json.loads(body)
+        except json.JSONDecodeError:
+            raise RuntimeError(f"HTTP {e.code}: {body}") from None
+
+
+# ------------------------------------------------------------------ #
+# Token file helpers                                                   #
+# ------------------------------------------------------------------ #
+
+def _save_tokens(data: dict) -> None:
+    TOKEN_DIR.mkdir(parents=True, exist_ok=True)
+    TOKEN_FILE.write_text(json.dumps(data, indent=2))
+    # Owner read/write only — nobody else should be able to read this
+    TOKEN_FILE.chmod(stat.S_IRUSR | stat.S_IWUSR)
+
+
+def _load_tokens() -> dict | None:
+    if not TOKEN_FILE.exists():
+        return None
+    # Warn if permissions are too open (e.g. on a shared filesystem)
+    mode = TOKEN_FILE.stat().st_mode
+    if mode & (stat.S_IRGRP | stat.S_IROTH):
+        print(
+            f"WARNING: {TOKEN_FILE} is readable by others. Run: chmod 600 {TOKEN_FILE}",
+            file=sys.stderr,
+        )
+    try:
+        return json.loads(TOKEN_FILE.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def _clear_tokens() -> None:
+    if TOKEN_FILE.exists():
+        TOKEN_FILE.unlink()
+
+
+# ------------------------------------------------------------------ #
+# Token lifecycle                                                      #
+# ------------------------------------------------------------------ #
+
+def _is_expired(tokens: dict) -> bool:
+    expires_at = tokens.get("expires_at", 0)
+    return time.time() >= (expires_at - REFRESH_BUFFER_SECONDS)
+
+
+def _refresh(tokens: dict, keycloak_url: str, client_id: str) -> dict:
+    refresh_token = tokens.get("refresh_token")
+    if not refresh_token:
+        raise RuntimeError("No refresh token available — please log in again.")
+
+    result = _post(
+        f"{keycloak_url}/protocol/openid-connect/token",
+        {
+            "grant_type": "refresh_token",
+            "client_id": client_id,
+            "refresh_token": refresh_token,
+        },
+    )
+
+    if "access_token" not in result:
+        raise RuntimeError(
+            f"Token refresh failed: {result.get('error_description', result)}. "
+            "Please log in again."
+        )
+
+    tokens = {
+        "access_token": result["access_token"],
+        "refresh_token": result.get("refresh_token", refresh_token),
+        "expires_at": time.time() + result["expires_in"],
+        "refresh_expires_at": time.time() + result.get("refresh_expires_in", 0),
+        "keycloak_url": keycloak_url,
+        "client_id": client_id,
+    }
+    _save_tokens(tokens)
+    return tokens
+
+
+def get_valid_token(keycloak_url: str = DEFAULT_KEYCLOAK_URL,
+                    client_id: str = DEFAULT_CLIENT_ID) -> str:
+    """
+    Return a valid access token, refreshing if necessary.
+    Raises RuntimeError if no valid session exists.
+    """
+    tokens = _load_tokens()
+    if tokens is None:
+        raise RuntimeError("Not logged in. Run: slurm-api-login")
+
+    # Use stored keycloak_url/client_id if available (handles site config changes gracefully)
+    kc_url = tokens.get("keycloak_url", keycloak_url)
+    c_id = tokens.get("client_id", client_id)
+
+    if _is_expired(tokens):
+        tokens = _refresh(tokens, kc_url, c_id)
+
+    return tokens["access_token"]
+
+
+# ------------------------------------------------------------------ #
+# Device Authorization Grant flow                                      #
+# ------------------------------------------------------------------ #
+
+def _login(keycloak_url: str, client_id: str) -> None:
+    print("Requesting device code from Keycloak...")
+
+    device_data = _post(
+        f"{keycloak_url}/protocol/openid-connect/auth/device",
+        {
+            "client_id": client_id,
+            "scope": "openid profile",
+        },
+    )
+
+    if "error" in device_data:
+        print(f"Error: {device_data.get('error_description', device_data['error'])}", file=sys.stderr)
+        sys.exit(1)
+
+    device_code = device_data["device_code"]
+    user_code = device_data["user_code"]
+    verification_uri = device_data["verification_uri_complete"]
+    expires_in = device_data["expires_in"]
+    interval = device_data.get("interval", 5)
+
+    print()
+    print("=" * 60)
+    print("  Open this URL in your browser to authenticate:")
+    print()
+    print(f"  {verification_uri}")
+    print()
+    print(f"  Your code is: {user_code}")
+    print(f"  (expires in {expires_in // 60} minutes)")
+    print("=" * 60)
+    print()
+    print("Waiting for authentication...", end="", flush=True)
+
+    deadline = time.time() + expires_in
+
+    while time.time() < deadline:
+        time.sleep(interval)
+        print(".", end="", flush=True)
+
+        result = _post(
+            f"{keycloak_url}/protocol/openid-connect/token",
+            {
+                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                "client_id": client_id,
+                "device_code": device_code,
+            },
+        )
+
+        if "access_token" in result:
+            print()
+            tokens = {
+                "access_token": result["access_token"],
+                "refresh_token": result.get("refresh_token"),
+                "expires_at": time.time() + result["expires_in"],
+                "refresh_expires_at": time.time() + result.get("refresh_expires_in", 0),
+                "keycloak_url": keycloak_url,
+                "client_id": client_id,
+            }
+            _save_tokens(tokens)
+            print("Logged in successfully.")
+            print(f"Token stored in {TOKEN_FILE}")
+            return
+
+        error = result.get("error", "")
+        if error == "authorization_pending":
+            continue
+        elif error == "slow_down":
+            interval += 5
+            continue
+        elif error in ("expired_token", "access_denied"):
+            print()
+            print(f"Authentication failed: {error}", file=sys.stderr)
+            sys.exit(1)
+        else:
+            print()
+            print(f"Unexpected error: {result}", file=sys.stderr)
+            sys.exit(1)
+
+    print()
+    print("Authentication timed out. Please try again.", file=sys.stderr)
+    sys.exit(1)
+
+
+# ------------------------------------------------------------------ #
+# CLI                                                                  #
+# ------------------------------------------------------------------ #
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Authenticate with the Slurm proxy via Keycloak."
+    )
+    parser.add_argument(
+        "--token",
+        action="store_true",
+        help="Print the current access token (refreshing if needed). "
+             "Use in scripts: TOKEN=$(slurm-api-login --token)",
+    )
+    parser.add_argument(
+        "--status",
+        action="store_true",
+        help="Show token status without attempting a refresh.",
+    )
+    parser.add_argument(
+        "--logout",
+        action="store_true",
+        help="Remove stored tokens.",
+    )
+    parser.add_argument("--keycloak-url", default=DEFAULT_KEYCLOAK_URL)
+    parser.add_argument("--client-id", default=DEFAULT_CLIENT_ID)
+
+    args = parser.parse_args()
+
+    if args.logout:
+        _clear_tokens()
+        print("Logged out.")
+        return
+
+    if args.status:
+        tokens = _load_tokens()
+        if tokens is None:
+            print("Not logged in.")
+            sys.exit(1)
+        expires_at = tokens.get("expires_at", 0)
+        refresh_expires_at = tokens.get("refresh_expires_at", 0)
+        now = time.time()
+        print(f"Access token expires:  {_fmt_remaining(expires_at - now)}")
+        print(f"Refresh token expires: {_fmt_remaining(refresh_expires_at - now)}")
+        return
+
+    if args.token:
+        try:
+            print(get_valid_token(args.keycloak_url, args.client_id))
+        except RuntimeError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(1)
+        return
+
+    # Default: full login flow
+    _login(args.keycloak_url, args.client_id)
+
+
+def _fmt_remaining(seconds: float) -> str:
+    if seconds <= 0:
+        return "expired"
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    if h:
+        return f"{h}h {m}m"
+    if m:
+        return f"{m}m {s}s"
+    return f"{s}s"
+
+
+if __name__ == "__main__":
+    main()
+

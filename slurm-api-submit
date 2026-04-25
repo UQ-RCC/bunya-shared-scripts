@@ -1,0 +1,495 @@
+#!/usr/bin/env python3
+"""
+slurm-api-submit
+==================
+Submits a batch script to Slurm via the REST proxy, behaving like sbatch.
+Parses #SBATCH directives from the script header and converts them to the
+slurmrestd JSON payload automatically.
+
+Usage:
+    slurm-api-submit myjob.sh
+    slurm-api-submit myjob.sh --partition gpu_rocm --time 04:00:00
+    slurm-api-submit myjob.sh --dry-run   # print JSON payload without submitting
+
+Command line arguments override #SBATCH directives in the script.
+
+Configuration:
+    SLURM_PROXY_URL          Base URL of the proxy
+    SLURM_KEYCLOAK_URL       Keycloak realm URL
+    SLURM_KEYCLOAK_CLIENT_ID OAuth2 client ID
+"""
+
+import argparse
+import json
+import os
+import re
+import stat
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+# ============================================================
+# CONFIGURATION — site admins edit these defaults
+# ============================================================
+DEFAULT_PROXY_URL = os.environ.get(
+    "SLURM_PROXY_URL", "https://slurm-api.rcc.uq.edu.au"
+)
+DEFAULT_KEYCLOAK_URL = os.environ.get(
+    "SLURM_KEYCLOAK_URL",
+    "https://iam.rcc.uq.edu.au/auth/realms/bunya",
+)
+DEFAULT_CLIENT_ID = os.environ.get("SLURM_KEYCLOAK_CLIENT_ID", "slurm-proxy")
+DEFAULT_API_VERSION = os.environ.get("SLURM_API_VERSION", "v0.0.41")
+# Template for the user's home directory on the cluster.
+# {username} is replaced with the username from the JWT.
+HOME_DIR_TEMPLATE = os.environ.get("SLURM_HOME_TEMPLATE", "/home/{username}")
+# ============================================================
+
+TOKEN_DIR = Path.home() / ".config" / "slurm-api"
+TOKEN_FILE = TOKEN_DIR / "token.json"
+REFRESH_BUFFER_SECONDS = 60
+
+
+# ------------------------------------------------------------------ #
+# Token handling (mirrors slurm-api-login)                          #
+# ------------------------------------------------------------------ #
+
+def _post_form(url: str, data: dict) -> dict:
+    encoded = urllib.parse.urlencode(data).encode()
+    req = urllib.request.Request(
+        url,
+        data=encoded,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode()
+        try:
+            return json.loads(body)
+        except json.JSONDecodeError:
+            raise RuntimeError(f"HTTP {e.code}: {body}") from None
+
+
+def _load_tokens() -> dict | None:
+    if not TOKEN_FILE.exists():
+        return None
+    mode = TOKEN_FILE.stat().st_mode
+    if mode & (stat.S_IRGRP | stat.S_IROTH):
+        print(f"WARNING: {TOKEN_FILE} is readable by others. Run: chmod 600 {TOKEN_FILE}",
+              file=sys.stderr)
+    try:
+        return json.loads(TOKEN_FILE.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def _save_tokens(data: dict) -> None:
+    TOKEN_DIR.mkdir(parents=True, exist_ok=True)
+    TOKEN_FILE.write_text(json.dumps(data, indent=2))
+    TOKEN_FILE.chmod(stat.S_IRUSR | stat.S_IWUSR)
+
+
+def _refresh(tokens: dict) -> dict:
+    refresh_token = tokens.get("refresh_token")
+    if not refresh_token:
+        raise RuntimeError("No refresh token — please run: slurm-api-login")
+    kc_url = tokens.get("keycloak_url", DEFAULT_KEYCLOAK_URL)
+    client_id = tokens.get("client_id", DEFAULT_CLIENT_ID)
+    result = _post_form(
+        f"{kc_url}/protocol/openid-connect/token",
+        {"grant_type": "refresh_token", "client_id": client_id, "refresh_token": refresh_token},
+    )
+    if "access_token" not in result:
+        raise RuntimeError(f"Token refresh failed: {result.get('error_description', result)}. "
+                           "Please run: slurm-api-login")
+    tokens = {
+        "access_token": result["access_token"],
+        "refresh_token": result.get("refresh_token", refresh_token),
+        "expires_at": time.time() + result["expires_in"],
+        "refresh_expires_at": time.time() + result.get("refresh_expires_in", 0),
+        "keycloak_url": kc_url,
+        "client_id": client_id,
+    }
+    _save_tokens(tokens)
+    return tokens
+
+
+def get_valid_token() -> str:
+    tokens = _load_tokens()
+    if tokens is None:
+        raise RuntimeError("Not logged in. Please run: slurm-api-login")
+    if time.time() >= tokens.get("expires_at", 0) - REFRESH_BUFFER_SECONDS:
+        tokens = _refresh(tokens)
+    return tokens["access_token"]
+
+
+# ------------------------------------------------------------------ #
+# #SBATCH directive parser                                             #
+# ------------------------------------------------------------------ #
+
+def get_username_from_token(token: str) -> str:
+    """Decode the JWT payload and extract preferred_username."""
+    import base64
+    payload = token.split(".")[1]
+    payload += "=" * (4 - len(payload) % 4)
+    claims = json.loads(base64.b64decode(payload).decode())
+    return claims.get("preferred_username") or claims.get("sub", "unknown")
+
+
+def parse_sbatch_directives(script: str) -> dict:
+    """
+    Extract #SBATCH directives from the script header.
+    Returns a dict of {flag: value} e.g. {"partition": "gpu_rocm", "time": "08:00:00"}.
+    Stops parsing at the first non-comment, non-blank line after the shebang.
+    """
+    directives = {}
+    lines = script.splitlines()
+    past_shebang = False
+
+    for line in lines:
+        stripped = line.strip()
+
+        if not past_shebang:
+            if stripped.startswith("#!"):
+                past_shebang = True
+                continue
+            continue
+
+        # Stop at first non-comment, non-blank line
+        if stripped and not stripped.startswith("#"):
+            break
+
+        match = re.match(r"^#SBATCH\s+(.+)$", stripped)
+        if not match:
+            continue
+
+        directive = match.group(1).strip()
+
+        # Handle --key=value and --key value and -k value forms
+        m = re.match(r"^--?([\w-]+)(?:[=\s]+(.+))?$", directive)
+        if m:
+            key = m.group(1)
+            value = m.group(2).strip() if m.group(2) else "true"
+            value = value.split("#")[0].strip()
+            directives[key] = value
+
+    return directives
+
+
+# ------------------------------------------------------------------ #
+# Directive → JSON payload conversion                                  #
+# ------------------------------------------------------------------ #
+
+def _parse_time(time_str: str) -> int:
+    """Convert Slurm time format to minutes. Accepts: MM, HH:MM, HH:MM:SS, D-HH:MM:SS"""
+    # D-HH:MM:SS
+    m = re.match(r"^(\d+)-(\d+):(\d+):(\d+)$", time_str)
+    if m:
+        d, h, mins, s = int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
+        return d * 24 * 60 + h * 60 + mins + (1 if s else 0)
+    # HH:MM:SS
+    m = re.match(r"^(\d+):(\d+):(\d+)$", time_str)
+    if m:
+        h, mins, s = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        return h * 60 + mins + (1 if s else 0)
+    # HH:MM
+    m = re.match(r"^(\d+):(\d+)$", time_str)
+    if m:
+        h, mins = int(m.group(1)), int(m.group(2))
+        return h * 60 + mins
+    # MM
+    if re.match(r"^\d+$", time_str):
+        return int(time_str)
+    raise ValueError(f"Cannot parse time: {time_str}")
+
+
+def _parse_memory(mem_str: str) -> int:
+    """Convert Slurm memory string to MB. Accepts: 128G, 128GB, 2048M, 2048MB, 1T"""
+    m = re.match(r"^(\d+(?:\.\d+)?)\s*([KMGT]?)B?$", mem_str.strip().upper())
+    if not m:
+        raise ValueError(f"Cannot parse memory: {mem_str}")
+    value = float(m.group(1))
+    unit = m.group(2)
+    multipliers = {"K": 1/1024, "": 1, "M": 1, "G": 1024, "T": 1024 * 1024}
+    return int(value * multipliers.get(unit, 1))
+
+
+def build_payload(script: str, directives: dict, username: str = "") -> dict:
+    """
+    Build the slurmrestd JSON payload from the script and parsed directives.
+    """
+    job = {}
+
+    # --- Name ---
+    if "job-name" in directives:
+        job["name"] = directives["job-name"]
+    elif "J" in directives:
+        job["name"] = directives["J"]
+
+    # --- Partition ---
+    if "partition" in directives:
+        job["partition"] = directives["partition"]
+    elif "p" in directives:
+        job["partition"] = directives["p"]
+
+    # --- QOS ---
+    if "qos" in directives:
+        job["qos"] = directives["qos"]
+    elif "q" in directives:
+        job["qos"] = directives["q"]
+
+    # --- Nodes ---
+    if "nodes" in directives:
+        val = directives["nodes"]
+        # Handle node ranges like 2-4 — use minimum
+        if "-" in str(val):
+            job["nodes"] = int(val.split("-")[0])
+        else:
+            job["nodes"] = int(val)
+    elif "N" in directives:
+        job["nodes"] = int(directives["N"])
+
+    # --- Tasks ---
+    if "ntasks" in directives:
+        job["tasks"] = int(directives["ntasks"])
+    elif "n" in directives:
+        job["tasks"] = int(directives["n"])
+
+    if "ntasks-per-node" in directives:
+        job["tasks_per_node"] = int(directives["ntasks-per-node"])
+
+    # --- CPUs ---
+    if "cpus-per-task" in directives:
+        job["cpus_per_task"] = int(directives["cpus-per-task"])
+    elif "c" in directives:
+        job["cpus_per_task"] = int(directives["c"])
+
+    # --- Memory ---
+    mem_str = None
+    if "mem" in directives:
+        mem_str = directives["mem"]
+    elif "mem-per-cpu" in directives:
+        # Approximate: mem-per-cpu * cpus_per_task
+        cpus = job.get("cpus_per_task", 1)
+        mem_mb = _parse_memory(directives["mem-per-cpu"]) * cpus
+        mem_str = f"{mem_mb}M"
+
+    if mem_str:
+        job["memory_per_node"] = {
+            "number": _parse_memory(mem_str),
+            "set": True,
+            "infinite": False,
+        }
+
+    # --- Time ---
+    if "time" in directives:
+        job["time_limit"] = _parse_time(directives["time"])
+    elif "t" in directives:
+        job["time_limit"] = _parse_time(directives["t"])
+
+    # --- GRES ---
+    if "gres" in directives:
+        job["tres_per_job"] = f"gres/{directives['gres']}"
+
+    # --- GPU (--gpus shorthand) ---
+    if "gpus" in directives:
+        job["tres_per_job"] = f"gres/gpu:{directives['gpus']}"
+    elif "gpus-per-node" in directives:
+        job["tres_per_node"] = f"gres/gpu:{directives['gpus-per-node']}"
+
+    # --- Working directory ---
+    if "chdir" in directives or "workdir" in directives:
+        job["current_working_directory"] = directives.get("chdir") or directives.get("workdir")
+    elif "D" in directives:
+        job["current_working_directory"] = directives["D"]
+    elif username:
+        job["current_working_directory"] = HOME_DIR_TEMPLATE.format(username=username)
+
+    # --- Output / Error ---
+    if "output" in directives:
+        job["standard_output"] = directives["output"]
+    elif "o" in directives:
+        job["standard_output"] = directives["o"]
+
+    if "error" in directives:
+        job["standard_error"] = directives["error"]
+    elif "e" in directives:
+        job["standard_error"] = directives["e"]
+
+    # --- Account ---
+    if "account" in directives:
+        job["account"] = directives["account"]
+    elif "A" in directives:
+        job["account"] = directives["A"]
+
+    # --- Constraint ---
+    if "constraint" in directives:
+        job["constraints"] = directives["constraint"]
+    elif "C" in directives:
+        job["constraints"] = directives["C"]
+
+    # --- Mail ---
+    if "mail-user" in directives:
+        job["mail_user"] = directives["mail-user"]
+    if "mail-type" in directives:
+        job["mail_type"] = directives["mail-type"]
+
+    # --- Environment ---
+    # Pass through the current environment so the job behaves like sbatch
+    env = [f"{k}={v}" for k, v in os.environ.items()
+           if "\n" not in v and "\x00" not in v]
+    job["environment"] = env
+
+    return {"job": job, "script": script}
+
+
+# ------------------------------------------------------------------ #
+# HTTP submission                                                      #
+# ------------------------------------------------------------------ #
+
+def submit(payload: dict, token: str, proxy_url: str, api_version: str) -> dict:
+    url = f"{proxy_url}/slurm/{api_version}/job/submit"
+    body = json.dumps(payload).encode()
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode()
+        try:
+            return json.loads(body)
+        except json.JSONDecodeError:
+            raise RuntimeError(f"HTTP {e.code}: {body}") from None
+
+
+# ------------------------------------------------------------------ #
+# CLI                                                                  #
+# ------------------------------------------------------------------ #
+
+# Subset of sbatch flags we accept as CLI overrides.
+# These override #SBATCH directives in the script.
+SBATCH_OVERRIDES = [
+    ("--job-name", "-J", "job-name", "Job name"),
+    ("--partition", "-p", "partition", "Partition"),
+    ("--qos", "-q", "qos", "QOS"),
+    ("--nodes", "-N", "nodes", "Number of nodes"),
+    ("--ntasks", "-n", "ntasks", "Number of tasks"),
+    ("--ntasks-per-node", None, "ntasks-per-node", "Tasks per node"),
+    ("--cpus-per-task", "-c", "cpus-per-task", "CPUs per task"),
+    ("--mem", None, "mem", "Memory per node (e.g. 128G)"),
+    ("--time", "-t", "time", "Time limit (e.g. 08:00:00)"),
+    ("--gres", None, "gres", "Generic resources (e.g. gpu:mi210:1)"),
+    ("--account", "-A", "account", "Account"),
+    ("--output", "-o", "output", "Standard output file"),
+    ("--error", "-e", "error", "Standard error file"),
+    ("--chdir", "-D", "chdir", "Working directory"),
+    ("--constraint", "-C", "constraint", "Node constraint"),
+]
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Submit a batch script to Slurm via the REST proxy.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Command line arguments override #SBATCH directives in the script.",
+    )
+    parser.add_argument("script", help="Batch script to submit")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Print the JSON payload without submitting")
+    parser.add_argument("--proxy-url", default=DEFAULT_PROXY_URL)
+    parser.add_argument("--api-version", default=DEFAULT_API_VERSION)
+
+    # Add sbatch-compatible override flags
+    for long, short, key, help_text in SBATCH_OVERRIDES:
+        flags = [long]
+        if short:
+            flags.append(short)
+        parser.add_argument(*flags, dest=key.replace("-", "_"), default=None,
+                            help=f"Override: {help_text}")
+
+    args = parser.parse_args()
+
+    # Read the script
+    script_path = Path(args.script)
+    if not script_path.exists():
+        print(f"Error: script not found: {args.script}", file=sys.stderr)
+        sys.exit(1)
+
+    script = script_path.read_text()
+
+    # Parse #SBATCH directives from the script
+    directives = parse_sbatch_directives(script)
+
+    # Apply CLI overrides
+    for long, short, key, _ in SBATCH_OVERRIDES:
+        attr = key.replace("-", "_")
+        val = getattr(args, attr, None)
+        if val is not None:
+            directives[key] = val
+
+    # Build the payload
+    # Get token early so we can extract username for cwd default
+    try:
+        token = get_valid_token()
+        username = get_username_from_token(token)
+    except RuntimeError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        payload = build_payload(script, directives, username)
+    except ValueError as e:
+        print(f"Error building payload: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.dry_run:
+        # Truncate environment for readability
+        display = json.loads(json.dumps(payload))
+        env = display["job"].get("environment", [])
+        if len(env) > 5:
+            display["job"]["environment"] = env[:5] + [f"... ({len(env) - 5} more)"]
+        print(json.dumps(display, indent=2))
+        return
+
+    # Submit
+    try:
+        result = submit(payload, token, args.proxy_url, args.api_version)
+    except RuntimeError as e:
+        print(f"Submission error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # Print result in sbatch-like format
+    errors = result.get("errors", [])
+    warnings = result.get("warnings", [])
+
+    for w in warnings:
+        print(f"Warning: {w.get('description', w)}", file=sys.stderr)
+
+    if errors:
+        for e in errors:
+            print(f"Error: {e.get('error', e.get('description', e))}", file=sys.stderr)
+        sys.exit(1)
+
+    job_id = result.get("job_id")
+    if job_id:
+        print(f"Submitted batch job {job_id}")
+    else:
+        print(json.dumps(result, indent=2))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# slurm-api-curl
+# ================
+# Thin wrapper around curl that automatically injects a valid Slurm proxy
+# Bearer token. Refreshes the token if needed.
+#
+# Usage (identical to curl, just replace 'curl' with 'slurm-api-curl'):
+#   slurm-api-curl /slurm/v0.0.41/jobs
+#   slurm-api-curl /slurm/v0.0.41/job/12345
+#   slurm-api-curl -X DELETE /slurm/v0.0.41/job/12345
+#
+# The SLURM_PROXY_URL environment variable (or the default below) is
+# prepended to relative paths automatically.
+#
+# Configuration:
+#   SLURM_PROXY_URL   Base URL, e.g. https://hpc.example.com/slurm-api
+
+set -euo pipefail
+
+PROXY_URL="${SLURM_PROXY_URL:-https://bunya-api.rcc.uq.edu.au}"
+
+# Find slurm-api-login — prefer same directory as this script, fall back to PATH
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -x "$SCRIPT_DIR/slurm-api-login" ]]; then
+    LOGIN="$SCRIPT_DIR/slurm-api-login"
+elif command -v slurm-api-login &>/dev/null; then
+    LOGIN="slurm-api-login"
+else
+    echo "Error: slurm-api-login not found in $SCRIPT_DIR or PATH" >&2
+    exit 1
+fi
+
+# Get a valid token — capture output; on failure, print the actual error
+TOKEN=$("$LOGIN" --token 2>&1)
+if [[ $? -ne 0 ]]; then
+    echo "$TOKEN" >&2
+    exit 1
+fi
+
+# If the first argument looks like a path (starts with /), prepend the proxy URL
+FIRST_ARG="${1:-}"
+if [[ "$FIRST_ARG" == /* ]]; then
+    shift
+    exec curl \
+        --silent \
+        --show-error \
+        -H "Authorization: Bearer ${TOKEN}" \
+        -H "Content-Type: application/json" \
+        "${PROXY_URL}${FIRST_ARG}" \
+        "$@"
+else
+    # Pass through as-is (user supplied a full URL or curl flags)
+    exec curl \
+        --silent \
+        --show-error \
+        -H "Authorization: Bearer ${TOKEN}" \
+        -H "Content-Type: application/json" \
+        "$@"
+fi
+
