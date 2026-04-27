@@ -51,8 +51,37 @@ For general acknowledgement, please see [Acknowledging RCC](https://rcc.uq.edu.a
    ```
 
 3. **Dependencies:**
-   * `Python 3.x`
+   * `Python 3.10` or higher (required for type hints and modern syntax)
    * `curl`
+
+   **Note for macOS Users:**
+   macOS defaults to Python 3.9 or older. Check your version with:
+   ```bash
+   python3 --version
+   ```
+   
+   Upgrade via one of the following — **pyenv is strongly recommended** if you manage multiple projects or Python versions:
+
+   - **Homebrew** — simple, system-wide:
+     ```bash
+     brew install python@3.12
+     ```
+     Note: Homebrew Python is unversioned by default (`python3` may still resolve to the old binary). You may need to adjust your `PATH` or use the explicit path `/opt/homebrew/opt/python@3.12/bin/python3`.
+
+   - **pyenv** — recommended for isolation and version control:
+     ```bash
+     brew install pyenv  # if not already installed
+     pyenv install 3.12
+     pyenv global 3.12   # or use 'pyenv local 3.12' to scope to this project
+     ```
+
+   After installing, create a virtual environment to isolate dependencies:
+   ```bash
+   python3 -m venv venv
+   source venv/bin/activate
+   ```
+
+---
 
 ## License
 
