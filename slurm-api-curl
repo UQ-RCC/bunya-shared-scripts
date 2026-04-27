@@ -17,7 +17,7 @@
 
 set -euo pipefail
 
-PROXY_URL="${SLURM_PROXY_URL:-https://bunya-api.rcc.uq.edu.au}"
+PROXY_URL="${SLURM_PROXY_URL:-https://onbunya.rcc.uq.edu.au}"
 
 # Find slurm-api-login — prefer same directory as this script, fall back to PATH
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -57,4 +57,3 @@ else
         -H "Content-Type: application/json" \
         "$@"
 fi
-

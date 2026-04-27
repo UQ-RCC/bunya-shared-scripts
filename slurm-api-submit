@@ -35,7 +35,7 @@ from pathlib import Path
 # CONFIGURATION — site admins edit these defaults
 # ============================================================
 DEFAULT_PROXY_URL = os.environ.get(
-    "SLURM_PROXY_URL", "https://slurm-api.rcc.uq.edu.au"
+    "SLURM_PROXY_URL", "https://onbunya.rcc.uq.edu.au"
 )
 DEFAULT_KEYCLOAK_URL = os.environ.get(
     "SLURM_KEYCLOAK_URL",
@@ -374,6 +374,8 @@ def submit(payload: dict, token: str, proxy_url: str, api_version: str) -> dict:
             return json.loads(body)
         except json.JSONDecodeError:
             raise RuntimeError(f"HTTP {e.code}: {body}") from None
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Connection error for {url}: {e.reason}") from None
 
 
 # ------------------------------------------------------------------ #
